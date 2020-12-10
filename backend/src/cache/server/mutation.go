@@ -26,9 +26,11 @@ import (
 	"github.com/kubeflow/pipelines/backend/src/cache/client"
 	"github.com/kubeflow/pipelines/backend/src/cache/model"
 	"github.com/kubeflow/pipelines/backend/src/cache/storage"
+	tektonv1beta1 "github.com/tektoncd/pipeline/pkg/apis/pipeline/v1beta1"
 	"k8s.io/api/admission/v1beta1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 )
 
 const (
@@ -37,16 +39,21 @@ const (
 	KFPCachedLabelKey         string = "pipelines.kubeflow.org/reused_from_cache"
 	KFPCachedLabelValue       string = "true"
 	ArgoWorkflowNodeName      string = "workflows.argoproj.io/node-name"
-	ArgoWorkflowTemplate      string = "workflows.argoproj.io/template"
+	TektonTaskrunTemplate     string = "takton.dev/template"
 	ExecutionKey              string = "pipelines.kubeflow.org/execution_cache_key"
 	CacheIDLabelKey           string = "pipelines.kubeflow.org/cache_id"
-	ArgoWorkflowOutputs       string = "workflows.argoproj.io/outputs"
+	TektonTaskrunOutputs      string = "tekton.dev/outputs"
 	MetadataWrittenKey        string = "pipelines.kubeflow.org/metadata_written"
 	AnnotationPath            string = "/metadata/annotations"
 	LabelPath                 string = "/metadata/labels"
 	SpecContainersPath        string = "/spec/containers"
 	SpecInitContainersPath    string = "/spec/initContainers"
 	TFXPodSuffix              string = "tfx/orchestration/kubeflow/container_entrypoint.py"
+	ArchiveLocationKey        string = "archiveLocation"
+	TaskName                  string = "tekton.dev/pipelineTask"
+
+	TektonGroup    string = "tekton.dev"
+	TektonTaskKind string = "TaskRun"
 )
 
 var (
@@ -56,6 +63,12 @@ var (
 type ClientManagerInterface interface {
 	CacheStore() storage.ExecutionCacheStoreInterface
 	KubernetesCoreClient() client.KubernetesCoreInterface
+	TektonClient() client.TektonInterface
+}
+
+type Template struct {
+	Spec     *tektonv1beta1.TaskSpec
+	TaskName string
 }
 
 // MutatePodIfCached will check whether the execution has already been run before from MLMD and apply the output into pod.metadata.output
@@ -84,28 +97,43 @@ func MutatePodIfCached(req *v1beta1.AdmissionRequest, clientMgr ClientManagerInt
 		return nil, nil
 	}
 
+	// what's this, could remove?
 	if isTFXPod(&pod) {
 		log.Printf("This pod %s is created by tfx pipelines.", pod.ObjectMeta.Name)
+		return nil, nil
+	}
+
+	// check if it's a taskrun owned pod TODO
+	trName, isTaskrunOwn := isTaskrunOwn(pod)
+	if !isTaskrunOwn {
+		log.Printf("This pod %s is not create by Taskrun.", pod.ObjectMeta.Name)
 		return nil, nil
 	}
 
 	var patches []patchOperation
 	annotations := pod.ObjectMeta.Annotations
 	labels := pod.ObjectMeta.Labels
-	template, exists := annotations[ArgoWorkflowTemplate]
+	_, exists := annotations[TektonTaskrunTemplate]
 	var executionHashKey string
 	if !exists {
 		return patches, nil
 	}
 
-	// Generate the executionHashKey based on pod.metadata.annotations.workflows.argoproj.io/template
-	executionHashKey, err := generateCacheKeyFromTemplate(template)
+	// get owner taskrun for the pod, for spec and taskname to calculate the hashcode TODO
+	tr, err := clientMgr.TektonClient().GetTaskRun(pod.Namespace, trName, metav1.GetOptions{})
+	if err != nil {
+		log.Printf("Unable to get Taskrun which own the Pod %s : %s", pod.ObjectMeta.Name, err.Error())
+		return patches, nil
+	}
+
+	// Generate the executionHashKey based on Taskrun.status.taskspec and the name of task
+	executionHashKey, template, err := generateCacheKeyFromTemplate(tr)
 	log.Println(executionHashKey)
 	if err != nil {
 		log.Printf("Unable to generate cache key for pod %s : %s", pod.ObjectMeta.Name, err.Error())
 		return patches, nil
 	}
-
+	annotations[TektonTaskrunTemplate] = template
 	annotations[ExecutionKey] = executionHashKey
 	labels[CacheIDLabelKey] = ""
 	var maxCacheStalenessInSeconds int64 = -1
@@ -123,33 +151,41 @@ func MutatePodIfCached(req *v1beta1.AdmissionRequest, clientMgr ClientManagerInt
 	if cachedExecution != nil {
 		log.Println("Cached output: " + cachedExecution.ExecutionOutput)
 
-		annotations[ArgoWorkflowOutputs] = getValueFromSerializedMap(cachedExecution.ExecutionOutput, ArgoWorkflowOutputs)
+		result := getValueFromSerializedMap(cachedExecution.ExecutionOutput, TektonTaskrunOutputs)
+		annotations[TektonTaskrunOutputs] = result
 		labels[CacheIDLabelKey] = strconv.FormatInt(cachedExecution.ID, 10)
 		labels[KFPCachedLabelKey] = KFPCachedLabelValue // This label indicates the pod is taken from cache.
-		
+
 		// These labels cache results for metadata-writer.
 		labels[MetadataExecutionIDKey] = getValueFromSerializedMap(cachedExecution.ExecutionOutput, MetadataExecutionIDKey)
 		labels[MetadataWrittenKey] = "true"
 
-		dummyContainer := corev1.Container{
-			Name:    "main",
-			Image:   "alpine",
-			Command: []string{`echo`, `"This step output is taken from cache."`},
+		// dummyContainer := corev1.Container{
+		// 	Name:    "main",
+		// 	Image:   "alpine",
+		// 	Command: []string{`echo`, `"This step output is taken from cache."`},
+		// }
+		// dummyContainers := []corev1.Container{
+		// 	dummyContainer,
+		// }
+
+		dummyContainers, err := prepareMainContainer(&pod, result)
+		if err != nil {
+			log.Printf("Unable prepare dummy container %s : %s", pod.ObjectMeta.Name, err.Error())
+			return patches, nil
 		}
-		dummyContainers := []corev1.Container{
-			dummyContainer,
-		}
+
 		patches = append(patches, patchOperation{
 			Op:    OperationTypeReplace,
 			Path:  SpecContainersPath,
 			Value: dummyContainers,
 		})
-		if pod.Spec.InitContainers != nil || len(pod.Spec.InitContainers) != 0 {
-			patches = append(patches, patchOperation{
-				Op:   OperationTypeRemove,
-				Path: SpecInitContainersPath,
-			})
-		}
+		// if pod.Spec.InitContainers != nil || len(pod.Spec.InitContainers) != 0 {
+		// 	patches = append(patches, patchOperation{
+		// 		Op:   OperationTypeRemove,
+		// 		Path: SpecInitContainersPath,
+		// 	})
+		// }
 	}
 
 	// Add executionKey to pod.metadata.annotations
@@ -169,56 +205,69 @@ func MutatePodIfCached(req *v1beta1.AdmissionRequest, clientMgr ClientManagerInt
 	return patches, nil
 }
 
-// intersectStructureWithSkeleton recursively intersects two maps
-// nil values in the skeleton map mean that the whole value (which can also be a map) should be kept.
-func intersectStructureWithSkeleton(src map[string]interface{}, skeleton map[string]interface{}) map[string]interface{} {
-	result := make(map[string]interface{})
-	for key, skeletonValue := range skeleton {
-		if value, ok := src[key]; ok {
-			if skeletonValue == nil {
-				result[key] = value
-			} else {
-				result[key] = intersectStructureWithSkeleton(value.(map[string]interface{}), skeletonValue.(map[string]interface{}))
-			}
+func prepareMainContainer(pod *corev1.Pod, result string) ([]corev1.Container, error) {
+	log.Println("start to prepare dummy containers.")
+	dummyContainers := []corev1.Container{}
+
+	results, err := unmarshalResult(result)
+	if err != nil {
+		return dummyContainers, err
+	}
+
+	args := []string{}
+	for _, result := range results {
+		arg := fmt.Sprintf("echo %s > /tekton/results/%s", result.Value, result.Name)
+		args = append(args, arg)
+	}
+
+	replacedArg := strings.Join(args, ";")
+
+	argStartFlag := -1
+	// assumptive there is only one container in section container
+	firstOriginalContainer := pod.Spec.Containers[0]
+
+	for index, arg := range firstOriginalContainer.Args {
+		if arg == "--" {
+			argStartFlag = index
 		}
 	}
-	return result
+
+	firstOriginalContainer.Args = append(firstOriginalContainer.Args[:argStartFlag+1], "/bin/bash")
+	firstOriginalContainer.Args = append(firstOriginalContainer.Args, "-c")
+	firstOriginalContainer.Args = append(firstOriginalContainer.Args, replacedArg)
+	firstOriginalContainer.Image = "ubuntu"
+
+	dummyContainers = append(dummyContainers, firstOriginalContainer)
+
+	return dummyContainers, nil
 }
 
-func generateCacheKeyFromTemplate(template string) (string, error) {
-	var templateMap map[string]interface{}
-	b := []byte(template)
-	err := json.Unmarshal(b, &templateMap)
+func unmarshalResult(taskResult string) ([]*tektonv1beta1.TaskRunResult, error) {
+	results := []*tektonv1beta1.TaskRunResult{}
+	err := json.Unmarshal([]byte(taskResult), results)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 
-	// Selectively copying parts of the template that should affect the cache
-	templateSkeleton := map[string]interface{}{
-		"container": map[string]interface{}{
-			"image":        nil,
-			"command":      nil,
-			"args":         nil,
-			"env":          nil,
-			"volumeMounts": nil,
-		},
-		"inputs":         nil,
-		"volumes":        nil,
-		"initContainers": nil,
-		"sidecars":       nil,
-	}
-	cacheKeyMap := intersectStructureWithSkeleton(templateMap, templateSkeleton)
+	return results, nil
+}
 
-	b, err = json.Marshal(cacheKeyMap)
+func generateCacheKeyFromTemplate(taskRun *tektonv1beta1.TaskRun) (string, string, error) {
+	labels := taskRun.ObjectMeta.Labels
+	template := Template{}
+	template.Spec = taskRun.Status.TaskSpec
+	template.TaskName = labels[TaskName]
+
+	b, err := json.Marshal(template)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 	hash := sha256.New()
 	hash.Write(b)
 	md := hash.Sum(nil)
 	executionHashKey := hex.EncodeToString(md)
 
-	return executionHashKey, nil
+	return executionHashKey, string(b), nil
 }
 
 func getValueFromSerializedMap(serializedMap string, key string) string {
@@ -262,4 +311,19 @@ func isTFXPod(pod *corev1.Pod) bool {
 	}
 	mainContainer := mainContainers[0]
 	return len(mainContainer.Command) != 0 && strings.HasSuffix(mainContainer.Command[len(mainContainer.Command)-1], TFXPodSuffix)
+}
+
+func isTaskrunOwn(obj interface{}) (string, bool) {
+	object, ok := obj.(metav1.Object)
+	if !ok {
+		return "", false
+	}
+
+	owner := metav1.GetControllerOf(object)
+	if owner == nil {
+		return "", false
+	}
+
+	ownerGV, err := schema.ParseGroupVersion(owner.APIVersion)
+	return owner.Name, err == nil && ownerGV.Group == TektonGroup && owner.Kind == TektonTaskKind
 }

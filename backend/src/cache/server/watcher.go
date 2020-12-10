@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -11,10 +12,13 @@ import (
 	"github.com/kubeflow/pipelines/backend/src/cache/client"
 	"github.com/kubeflow/pipelines/backend/src/cache/model"
 	"github.com/peterhellberg/duration"
+	"github.com/tektoncd/pipeline/pkg/apis/pipeline/v1beta1"
+	"github.com/tektoncd/pipeline/pkg/termination"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/watch"
+	"knative.dev/pkg/logging"
 )
 
 const (
@@ -58,10 +62,15 @@ func WatchPods(namespaceToWatch string, clientManager ClientManagerInterface) {
 				continue
 			}
 
-			executionOutput, exists := pod.ObjectMeta.Annotations[ArgoWorkflowOutputs]
+			// executionOutput, exists := pod.ObjectMeta.Annotations[ArgoWorkflowOutputs]
+			executionOutput, err := parseResult(pod)
+			if err != nil {
+				log.Printf("Result of Pod %s not parse success.", pod.ObjectMeta.Name)
+				continue
+			}
 
 			executionOutputMap := make(map[string]interface{})
-			executionOutputMap[ArgoWorkflowOutputs] = executionOutput
+			executionOutputMap[TektonTaskrunOutputs] = executionOutput
 			executionOutputMap[MetadataExecutionIDKey] = pod.ObjectMeta.Labels[MetadataExecutionIDKey]
 			executionOutputJSON, _ := json.Marshal(executionOutputMap)
 
@@ -71,7 +80,7 @@ func WatchPods(namespaceToWatch string, clientManager ClientManagerInterface) {
 				maxCacheStalenessInSeconds = getMaxCacheStaleness(executionMaxCacheStaleness)
 			}
 
-			executionTemplate := pod.ObjectMeta.Annotations[ArgoWorkflowTemplate]
+			executionTemplate := pod.ObjectMeta.Annotations[TektonTaskrunTemplate]
 			executionToPersist := model.ExecutionCache{
 				ExecutionCacheKey: executionKey,
 				ExecutionTemplate: executionTemplate,
@@ -90,6 +99,48 @@ func WatchPods(namespaceToWatch string, clientManager ClientManagerInterface) {
 			}
 		}
 	}
+}
+
+func parseResult(pod *corev1.Pod) (string, error) {
+	log.Println("Start parse result from pod.")
+
+	logger := logging.FromContext(context.TODO())
+	output := []*v1beta1.TaskRunResult{}
+
+	containersState := pod.Status.ContainerStatuses
+	if containersState == nil || len(containersState) == 0 {
+		return "", fmt.Errorf("No container status found")
+	}
+
+	for _, state := range containersState {
+		if state.State.Terminated != nil && len(state.State.Terminated.Message) != 0 {
+			msg := state.State.Terminated.Message
+			results, err := termination.ParseMessage(logger, msg)
+
+			if err != nil {
+				logger.Errorf("termination message could not be parsed as JSON: %v", err)
+				return "", fmt.Errorf("termination message could not be parsed as JSON: %v", err)
+			}
+
+			for _, r := range results {
+				if r.ResultType == v1beta1.TaskRunResultType {
+					itemRes := v1beta1.TaskRunResult{}
+					itemRes.Name = r.Key
+					itemRes.Value = r.Value
+					output = append(output, &itemRes)
+				}
+			}
+			// assumption only on step in a task
+			break
+		}
+	}
+
+	b, err := json.Marshal(output)
+	if err != nil {
+		return "", err
+	}
+
+	return string(b), nil
 }
 
 func isPodCompletedAndSucceeded(pod *corev1.Pod) bool {
