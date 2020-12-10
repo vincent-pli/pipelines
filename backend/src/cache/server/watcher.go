@@ -52,23 +52,23 @@ func WatchPods(namespaceToWatch string, clientManager ClientManagerInterface) {
 				log.Printf("Pod %s is not completed or not in successful status.", pod.ObjectMeta.Name)
 				continue
 			}
-
+			log.Println("---- step - 1")
 			if isCacheWriten(pod.ObjectMeta.Labels) {
 				continue
 			}
-
+			log.Println("---- step - 2")
 			executionKey, exists := pod.ObjectMeta.Annotations[ExecutionKey]
 			if !exists {
 				continue
 			}
-
+			log.Println("---- step - 3")
 			// executionOutput, exists := pod.ObjectMeta.Annotations[ArgoWorkflowOutputs]
 			executionOutput, err := parseResult(pod)
 			if err != nil {
 				log.Printf("Result of Pod %s not parse success.", pod.ObjectMeta.Name)
 				continue
 			}
-
+			log.Println("---- step - 4")
 			executionOutputMap := make(map[string]interface{})
 			executionOutputMap[TektonTaskrunOutputs] = executionOutput
 			executionOutputMap[MetadataExecutionIDKey] = pod.ObjectMeta.Labels[MetadataExecutionIDKey]
@@ -93,6 +93,7 @@ func WatchPods(namespaceToWatch string, clientManager ClientManagerInterface) {
 				log.Println("Unable to create cache entry.")
 				continue
 			}
+			log.Println("---- step - 5")
 			err = patchCacheID(k8sCore, pod, namespaceToWatch, cacheEntryCreated.ID)
 			if err != nil {
 				log.Printf(err.Error())
@@ -111,17 +112,21 @@ func parseResult(pod *corev1.Pod) (string, error) {
 	if containersState == nil || len(containersState) == 0 {
 		return "", fmt.Errorf("No container status found")
 	}
-
+	fmt.Printf("+++++++++++++++ %+v", containersState)
 	for _, state := range containersState {
+		fmt.Println("000000000000000")
 		if state.State.Terminated != nil && len(state.State.Terminated.Message) != 0 {
+			fmt.Println("111111111")
 			msg := state.State.Terminated.Message
 			results, err := termination.ParseMessage(logger, msg)
-
+			fmt.Println(msg)
+			fmt.Printf("xx %+v", results)
+			fmt.Println("222222222")
 			if err != nil {
 				logger.Errorf("termination message could not be parsed as JSON: %v", err)
 				return "", fmt.Errorf("termination message could not be parsed as JSON: %v", err)
 			}
-
+			fmt.Println("3333333")
 			for _, r := range results {
 				if r.ResultType == v1beta1.TaskRunResultType {
 					itemRes := v1beta1.TaskRunResult{}
@@ -130,21 +135,23 @@ func parseResult(pod *corev1.Pod) (string, error) {
 					output = append(output, &itemRes)
 				}
 			}
+			fmt.Println("4444444")
 			// assumption only on step in a task
 			break
 		}
 	}
-
+	fmt.Printf("---- %+v", output)
 	b, err := json.Marshal(output)
 	if err != nil {
 		return "", err
 	}
-
+	fmt.Println("________________")
+	fmt.Println(string(b))
 	return string(b), nil
 }
 
 func isPodCompletedAndSucceeded(pod *corev1.Pod) bool {
-	return pod.ObjectMeta.Labels[ArgoCompleteLabelKey] == "true" && pod.Status.Phase == corev1.PodSucceeded
+	return pod.Status.Phase == corev1.PodSucceeded
 }
 
 func isCacheWriten(labels map[string]string) bool {

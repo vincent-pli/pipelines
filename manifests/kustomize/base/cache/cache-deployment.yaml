@@ -16,34 +16,34 @@ spec:
     spec:
       containers:
       - name: server
-        image: gcr.io/ml-pipeline/cache-server:dummy
+        image: docker.io/vincentpli/cache-server:v0.1.0
         env:
           - name: DBCONFIG_DRIVER
             value: mysql
           - name: DBCONFIG_DB_NAME
             valueFrom:
               configMapKeyRef:
-                name: pipeline-install-config
+                name: pipeline-install-config-6dcfhbk5b9
                 key: cacheDb
           - name: DBCONFIG_HOST_NAME
             valueFrom:
               configMapKeyRef:
-                name: pipeline-install-config
+                name: pipeline-install-config-6dcfhbk5b9
                 key: dbHost
           - name: DBCONFIG_PORT
             valueFrom:
               configMapKeyRef:
-                name: pipeline-install-config
+                name: pipeline-install-config-6dcfhbk5b9
                 key: dbPort
           - name: DBCONFIG_USER
             valueFrom:
               secretKeyRef:
-                name: mysql-secret
+                name: mysql-secret-fd5gktm75t
                 key: username
           - name: DBCONFIG_PASSWORD
             valueFrom:
               secretKeyRef:
-                name: mysql-secret
+                name: mysql-secret-fd5gktm75t
                 key: password
           - name: NAMESPACE_TO_WATCH
             valueFrom:

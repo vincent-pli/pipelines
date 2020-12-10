@@ -30,7 +30,6 @@ import (
 	"k8s.io/api/admission/v1beta1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/runtime/schema"
 )
 
 const (
@@ -39,7 +38,7 @@ const (
 	KFPCachedLabelKey         string = "pipelines.kubeflow.org/reused_from_cache"
 	KFPCachedLabelValue       string = "true"
 	ArgoWorkflowNodeName      string = "workflows.argoproj.io/node-name"
-	TektonTaskrunTemplate     string = "takton.dev/template"
+	TektonTaskrunTemplate     string = "tekton.dev/template"
 	ExecutionKey              string = "pipelines.kubeflow.org/execution_cache_key"
 	CacheIDLabelKey           string = "pipelines.kubeflow.org/cache_id"
 	TektonTaskrunOutputs      string = "tekton.dev/outputs"
@@ -52,7 +51,7 @@ const (
 	ArchiveLocationKey        string = "archiveLocation"
 	TaskName                  string = "tekton.dev/pipelineTask"
 
-	TektonGroup    string = "tekton.dev"
+	TektonGroup    string = "tekton.dev/v1beta1"
 	TektonTaskKind string = "TaskRun"
 )
 
@@ -104,8 +103,8 @@ func MutatePodIfCached(req *v1beta1.AdmissionRequest, clientMgr ClientManagerInt
 	}
 
 	// check if it's a taskrun owned pod TODO
-	trName, isTaskrunOwn := isTaskrunOwn(pod)
-	if !isTaskrunOwn {
+	trName, isTaskrunOwned := isTaskrunOwn(&pod)
+	if !isTaskrunOwned {
 		log.Printf("This pod %s is not create by Taskrun.", pod.ObjectMeta.Name)
 		return nil, nil
 	}
@@ -232,8 +231,8 @@ func prepareMainContainer(pod *corev1.Pod, result string) ([]corev1.Container, e
 		}
 	}
 
-	firstOriginalContainer.Args = append(firstOriginalContainer.Args[:argStartFlag+1], "/bin/bash")
-	firstOriginalContainer.Args = append(firstOriginalContainer.Args, "-c")
+	firstOriginalContainer.Args = append(firstOriginalContainer.Args[:argStartFlag+1], "-c")
+	//firstOriginalContainer.Args = append(firstOriginalContainer.Args, "-c")
 	firstOriginalContainer.Args = append(firstOriginalContainer.Args, replacedArg)
 	firstOriginalContainer.Image = "ubuntu"
 
@@ -242,21 +241,22 @@ func prepareMainContainer(pod *corev1.Pod, result string) ([]corev1.Container, e
 	return dummyContainers, nil
 }
 
-func unmarshalResult(taskResult string) ([]*tektonv1beta1.TaskRunResult, error) {
-	results := []*tektonv1beta1.TaskRunResult{}
-	err := json.Unmarshal([]byte(taskResult), results)
+func unmarshalResult(taskResult string) ([]tektonv1beta1.TaskRunResult, error) {
+	fmt.Println("xxxxxxxxxxxxxxx")
+	fmt.Println(taskResult)
+	var results []tektonv1beta1.TaskRunResult
+	err := json.Unmarshal([]byte(taskResult), &results)
 	if err != nil {
 		return nil, err
 	}
-
+	fmt.Printf("xxxxxxx %+v", results)
 	return results, nil
 }
 
 func generateCacheKeyFromTemplate(taskRun *tektonv1beta1.TaskRun) (string, string, error) {
-	labels := taskRun.ObjectMeta.Labels
 	template := Template{}
-	template.Spec = taskRun.Status.TaskSpec
-	template.TaskName = labels[TaskName]
+	template.Spec = taskRun.Spec.TaskSpec
+	template.TaskName = taskRun.Name
 
 	b, err := json.Marshal(template)
 	if err != nil {
@@ -313,17 +313,13 @@ func isTFXPod(pod *corev1.Pod) bool {
 	return len(mainContainer.Command) != 0 && strings.HasSuffix(mainContainer.Command[len(mainContainer.Command)-1], TFXPodSuffix)
 }
 
-func isTaskrunOwn(obj interface{}) (string, bool) {
-	object, ok := obj.(metav1.Object)
-	if !ok {
-		return "", false
+func isTaskrunOwn(pod *corev1.Pod) (string, bool) {
+	for _, ref := range pod.GetOwnerReferences() {
+		if ref.Kind == TektonTaskKind && ref.APIVersion == TektonGroup {
+			return ref.Name, true
+		}
 	}
 
-	owner := metav1.GetControllerOf(object)
-	if owner == nil {
-		return "", false
-	}
-
-	ownerGV, err := schema.ParseGroupVersion(owner.APIVersion)
-	return owner.Name, err == nil && ownerGV.Group == TektonGroup && owner.Kind == TektonTaskKind
+	return "", false
 }
+
