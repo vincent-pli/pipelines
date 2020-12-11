@@ -19,7 +19,6 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"log"
 	"strconv"
 	"strings"
 
@@ -27,6 +26,7 @@ import (
 	"github.com/kubeflow/pipelines/backend/src/cache/model"
 	"github.com/kubeflow/pipelines/backend/src/cache/storage"
 	tektonv1beta1 "github.com/tektoncd/pipeline/pkg/apis/pipeline/v1beta1"
+	"go.uber.org/zap"
 	"k8s.io/api/admission/v1beta1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -72,11 +72,16 @@ type Template struct {
 
 // MutatePodIfCached will check whether the execution has already been run before from MLMD and apply the output into pod.metadata.output
 func MutatePodIfCached(req *v1beta1.AdmissionRequest, clientMgr ClientManagerInterface) ([]patchOperation, error) {
+	zapLog, _ := zap.NewProduction()
+	logger := zapLog.Sugar()
+	defer zapLog.Sync()
+
+	logger.Infof("Request received: %#v", req.Resource)
 	// This handler should only get called on Pod objects as per the MutatingWebhookConfiguration in the YAML file.
 	// However, if (for whatever reason) this gets invoked on an object of a different kind, issue a log message but
 	// let the object request pass through otherwise.
 	if req.Resource != podResource {
-		log.Printf("Expect resource to be %q, but found %q", podResource, req.Resource)
+		logger.Errorf("Expect resource to be %#v, but found %#v", podResource, req.Resource)
 		return nil, nil
 	}
 
@@ -91,21 +96,21 @@ func MutatePodIfCached(req *v1beta1.AdmissionRequest, clientMgr ClientManagerInt
 	// TODO: Switch to objectSelector once Kubernetes 1.15 hits the GKE stable channel. See
 	// https://github.com/kubernetes/kubernetes/pull/78505
 	// https://cloud.google.com/kubernetes-engine/docs/release-notes-stable
-	if !isKFPCacheEnabled(&pod) {
-		log.Printf("This pod %s does not enable cache.", pod.ObjectMeta.Name)
+	if !isKFPCacheEnabled(&pod, logger) {
+		logger.Errorf("This pod %s does not enable cache.", pod.ObjectMeta.Name)
 		return nil, nil
 	}
 
-	// what's this, could remove?
-	if isTFXPod(&pod) {
-		log.Printf("This pod %s is created by tfx pipelines.", pod.ObjectMeta.Name)
+	// What's this, could remove?
+	if isTFXPod(&pod, logger) {
+		logger.Errorf("This pod %s is created by tfx pipelines.", pod.ObjectMeta.Name)
 		return nil, nil
 	}
 
-	// check if it's a taskrun owned pod TODO
+	// Check if it's a taskrun owned pod
 	trName, isTaskrunOwned := isTaskrunOwn(&pod)
 	if !isTaskrunOwned {
-		log.Printf("This pod %s is not create by Taskrun.", pod.ObjectMeta.Name)
+		logger.Errorf("This pod %s is not owned by Taskrun.", pod.ObjectMeta.Name)
 		return nil, nil
 	}
 
@@ -115,21 +120,21 @@ func MutatePodIfCached(req *v1beta1.AdmissionRequest, clientMgr ClientManagerInt
 	_, exists := annotations[TektonTaskrunTemplate]
 	var executionHashKey string
 	if !exists {
+		logger.Errorf("This pod %s has no annotation: tekton.dev/template.", pod.ObjectMeta.Name)
 		return patches, nil
 	}
 
 	// get owner taskrun for the pod, for spec and taskname to calculate the hashcode TODO
 	tr, err := clientMgr.TektonClient().GetTaskRun(pod.Namespace, trName, metav1.GetOptions{})
 	if err != nil {
-		log.Printf("Unable to get Taskrun which own the Pod %s : %s", pod.ObjectMeta.Name, err.Error())
+		logger.Errorf("Unable to get Taskrun which own the Pod %s/%s : %v", pod.ObjectMeta.Namespace, trName, err)
 		return patches, nil
 	}
 
 	// Generate the executionHashKey based on Taskrun.status.taskspec and the name of task
 	executionHashKey, template, err := generateCacheKeyFromTemplate(tr)
-	log.Println(executionHashKey)
 	if err != nil {
-		log.Printf("Unable to generate cache key for pod %s : %s", pod.ObjectMeta.Name, err.Error())
+		logger.Errorf("Unable to generate cache key for pod %s : %v", pod.ObjectMeta.Name, err)
 		return patches, nil
 	}
 	annotations[TektonTaskrunTemplate] = template
@@ -144,11 +149,12 @@ func MutatePodIfCached(req *v1beta1.AdmissionRequest, clientMgr ClientManagerInt
 	var cachedExecution *model.ExecutionCache
 	cachedExecution, err = clientMgr.CacheStore().GetExecutionCache(executionHashKey, maxCacheStalenessInSeconds)
 	if err != nil {
-		log.Println(err.Error())
+		logger.Errorf("Failed when try to get cache from storage: %v", err)
+		return patches, nil
 	}
 	// Found cached execution, add cached output and cache_id and replace container images.
 	if cachedExecution != nil {
-		log.Println("Cached output: " + cachedExecution.ExecutionOutput)
+		logger.Infof("Cached output: " + cachedExecution.ExecutionOutput)
 
 		result := getValueFromSerializedMap(cachedExecution.ExecutionOutput, TektonTaskrunOutputs)
 		annotations[TektonTaskrunOutputs] = result
@@ -159,18 +165,9 @@ func MutatePodIfCached(req *v1beta1.AdmissionRequest, clientMgr ClientManagerInt
 		labels[MetadataExecutionIDKey] = getValueFromSerializedMap(cachedExecution.ExecutionOutput, MetadataExecutionIDKey)
 		labels[MetadataWrittenKey] = "true"
 
-		// dummyContainer := corev1.Container{
-		// 	Name:    "main",
-		// 	Image:   "alpine",
-		// 	Command: []string{`echo`, `"This step output is taken from cache."`},
-		// }
-		// dummyContainers := []corev1.Container{
-		// 	dummyContainer,
-		// }
-
-		dummyContainers, err := prepareMainContainer(&pod, result)
-		if err != nil {
-			log.Printf("Unable prepare dummy container %s : %s", pod.ObjectMeta.Name, err.Error())
+		dummyContainers, err := prepareMainContainer(&pod, result, logger)
+		if err != nil || len(dummyContainers) == 0 {
+			logger.Errorf("Unable prepare dummy container %s : %v", pod.ObjectMeta.Name, err)
 			return patches, nil
 		}
 
@@ -179,6 +176,8 @@ func MutatePodIfCached(req *v1beta1.AdmissionRequest, clientMgr ClientManagerInt
 			Path:  SpecContainersPath,
 			Value: dummyContainers,
 		})
+
+		// Handler init containers, do or not?
 		// if pod.Spec.InitContainers != nil || len(pod.Spec.InitContainers) != 0 {
 		// 	patches = append(patches, patchOperation{
 		// 		Op:   OperationTypeRemove,
@@ -204,12 +203,13 @@ func MutatePodIfCached(req *v1beta1.AdmissionRequest, clientMgr ClientManagerInt
 	return patches, nil
 }
 
-func prepareMainContainer(pod *corev1.Pod, result string) ([]corev1.Container, error) {
-	log.Println("start to prepare dummy containers.")
+func prepareMainContainer(pod *corev1.Pod, result string, logger *zap.SugaredLogger) ([]corev1.Container, error) {
+	logger.Infof("Start to prepare dummy containers.")
 	dummyContainers := []corev1.Container{}
 
 	results, err := unmarshalResult(result)
 	if err != nil {
+		logger.Errorf("Unmarshal result of taskrun failed: ", err)
 		return dummyContainers, err
 	}
 
@@ -232,7 +232,6 @@ func prepareMainContainer(pod *corev1.Pod, result string) ([]corev1.Container, e
 	}
 
 	firstOriginalContainer.Args = append(firstOriginalContainer.Args[:argStartFlag+1], "-c")
-	//firstOriginalContainer.Args = append(firstOriginalContainer.Args, "-c")
 	firstOriginalContainer.Args = append(firstOriginalContainer.Args, replacedArg)
 	firstOriginalContainer.Image = "ubuntu"
 
@@ -242,14 +241,12 @@ func prepareMainContainer(pod *corev1.Pod, result string) ([]corev1.Container, e
 }
 
 func unmarshalResult(taskResult string) ([]tektonv1beta1.TaskRunResult, error) {
-	fmt.Println("xxxxxxxxxxxxxxx")
-	fmt.Println(taskResult)
 	var results []tektonv1beta1.TaskRunResult
 	err := json.Unmarshal([]byte(taskResult), &results)
 	if err != nil {
 		return nil, err
 	}
-	fmt.Printf("xxxxxxx %+v", results)
+
 	return results, nil
 }
 
@@ -285,19 +282,19 @@ func getValueFromSerializedMap(serializedMap string, key string) string {
 	return value
 }
 
-func isKFPCacheEnabled(pod *corev1.Pod) bool {
+func isKFPCacheEnabled(pod *corev1.Pod, logger *zap.SugaredLogger) bool {
 	cacheEnabled, exists := pod.ObjectMeta.Labels[KFPCacheEnabledLabelKey]
 	if !exists {
-		log.Printf("This pod %s is not created by KFP.", pod.ObjectMeta.Name)
+		logger.Errorf("This pod %s is not created by KFP.", pod.ObjectMeta.Name)
 		return false
 	}
 	return cacheEnabled == KFPCacheEnabledLabelValue
 }
 
-func isTFXPod(pod *corev1.Pod) bool {
+func isTFXPod(pod *corev1.Pod, logger *zap.SugaredLogger) bool {
 	containers := pod.Spec.Containers
 	if containers == nil || len(containers) == 0 {
-		log.Printf("This pod container does not exist.")
+		logger.Info("This pod container does not exist.")
 		return true
 	}
 	var mainContainers []corev1.Container
@@ -322,4 +319,3 @@ func isTaskrunOwn(pod *corev1.Pod) (string, bool) {
 
 	return "", false
 }
-
