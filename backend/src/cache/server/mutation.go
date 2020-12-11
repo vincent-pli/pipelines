@@ -275,7 +275,7 @@ func unmarshalResult(taskResult string) ([]tektonv1beta1.TaskRunResult, error) {
 func generateCacheKeyFromTemplate(taskRun *tektonv1beta1.TaskRun) (string, string, error) {
 	template := Template{}
 	template.Spec = taskRun.Spec.TaskSpec
-	template.TaskName = taskRun.Name
+	template.TaskName = taskRun.Name[:len(taskRun.Name)-6]
 
 	b, err := json.Marshal(template)
 	if err != nil {
