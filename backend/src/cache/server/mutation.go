@@ -230,7 +230,9 @@ func prepareMainContainer(pod *corev1.Pod, result string, logger *zap.SugaredLog
 		}
 	}
 
-	firstOriginalContainer.Args = append(firstOriginalContainer.Args[:argStartFlag+1], "-c")
+	firstOriginalContainer.Args = append(firstOriginalContainer.Args[:argStartFlag-1], "/bin/bash")
+	firstOriginalContainer.Args = append(firstOriginalContainer.Args, "--")
+	firstOriginalContainer.Args = append(firstOriginalContainer.Args, "-c")
 	firstOriginalContainer.Args = append(firstOriginalContainer.Args, replacedArg)
 	firstOriginalContainer.Image = "ubuntu"
 
