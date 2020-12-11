@@ -51,8 +51,9 @@ const (
 	ArchiveLocationKey        string = "archiveLocation"
 	TaskName                  string = "tekton.dev/pipelineTask"
 
-	TektonGroup    string = "tekton.dev/v1beta1"
-	TektonTaskKind string = "TaskRun"
+	TektonGroup        string = "tekton.dev/v1beta1"
+	TektonTaskKind     string = "TaskRun"
+	ToolInitContainner string = "place-tools"
 )
 
 var (
@@ -177,12 +178,19 @@ func MutatePodIfCached(req *v1beta1.AdmissionRequest, clientMgr ClientManagerInt
 		})
 
 		// Handler init containers, do or not?
-		// if pod.Spec.InitContainers != nil || len(pod.Spec.InitContainers) != 0 {
-		// 	patches = append(patches, patchOperation{
-		// 		Op:   OperationTypeRemove,
-		// 		Path: SpecInitContainersPath,
-		// 	})
-		// }
+		if pod.Spec.InitContainers != nil || len(pod.Spec.InitContainers) != 0 {
+			dummyInitContainers, err := prepareInitContainer(&pod, logger)
+			if err != nil {
+				logger.Errorf("Unable prepare dummy init container %s : %v", pod.ObjectMeta.Name, err)
+				return patches, nil
+			}
+
+			patches = append(patches, patchOperation{
+				Op:    OperationTypeReplace,
+				Path:  SpecInitContainersPath,
+				Value: dummyInitContainers,
+			})
+		}
 	}
 
 	// Add executionKey to pod.metadata.annotations
@@ -200,6 +208,19 @@ func MutatePodIfCached(req *v1beta1.AdmissionRequest, clientMgr ClientManagerInt
 	})
 
 	return patches, nil
+}
+
+func prepareInitContainer(pod *corev1.Pod, logger *zap.SugaredLogger) ([]corev1.Container, error) {
+	logger.Infof("Start to prepare dummy init containers.")
+	dummyContainers := []corev1.Container{}
+
+	for _, container := range pod.Spec.InitContainers {
+		if container.Name == ToolInitContainner {
+			dummyContainers = append(dummyContainers, container)
+		}
+	}
+
+	return dummyContainers, nil
 }
 
 func prepareMainContainer(pod *corev1.Pod, result string, logger *zap.SugaredLogger) ([]corev1.Container, error) {
