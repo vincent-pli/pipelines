@@ -99,7 +99,7 @@ func WatchPods(namespaceToWatch string, clientManager ClientManagerInterface) {
 				continue
 			}
 
-			err = patchCacheID(k8sCore, pod, namespaceToWatch, cacheEntryCreated.ID)
+			err = patchCacheID(k8sCore, pod, namespaceToWatch, cacheEntryCreated.ID, logger)
 			if err != nil {
 				logger.Errorf("Patch Pod: %s failed", pod.ObjectMeta.Name)
 			}
