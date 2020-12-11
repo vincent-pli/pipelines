@@ -235,7 +235,7 @@ func prepareMainContainer(pod *corev1.Pod, result string, logger *zap.SugaredLog
 
 	args := []string{}
 	for _, result := range results {
-		arg := fmt.Sprintf("echo %s > /tekton/results/%s", result.Value, result.Name)
+		arg := fmt.Sprintf("printf %s | tee /tekton/results/%s", result.Value, result.Name)
 		args = append(args, arg)
 	}
 
