@@ -149,8 +149,7 @@ func MutatePodIfCached(req *v1beta1.AdmissionRequest, clientMgr ClientManagerInt
 	var cachedExecution *model.ExecutionCache
 	cachedExecution, err = clientMgr.CacheStore().GetExecutionCache(executionHashKey, maxCacheStalenessInSeconds)
 	if err != nil {
-		logger.Errorf("Failed when try to get cache from storage: %v", err)
-		return patches, nil
+		logger.Warnf("Failed when try to get cache from storage: %v", err)
 	}
 	// Found cached execution, add cached output and cache_id and replace container images.
 	if cachedExecution != nil {
